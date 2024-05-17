@@ -2,6 +2,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use csv::ReaderBuilder;
 use std::collections::HashMap;
+use rayon::prelude::*;
 use yata::methods::{EMA, SMA};
 use yata::prelude::*;
 
@@ -25,14 +26,14 @@ pub struct MarketData {
 }
 
 impl MarketData {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            dates: Vec::new(),
-            opens: Vec::new(),
-            highs: Vec::new(),
-            lows: Vec::new(),
-            closes: Vec::new(),
-            volumes: Vec::new(),
+            dates: Vec::with_capacity(capacity),
+            opens: Vec::with_capacity(capacity),
+            highs: Vec::with_capacity(capacity),
+            lows: Vec::with_capacity(capacity),
+            closes: Vec::with_capacity(capacity),
+            volumes: Vec::with_capacity(capacity),
         }
     }
 
@@ -44,11 +45,19 @@ impl MarketData {
         self.closes.push(close);
         self.volumes.push(volume);
     }
+
+    fn len(&self) -> usize {
+        self.dates.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.dates.is_empty()
+    }
 }
 
 pub fn read_csv_data(path: &str) -> Result<MarketData, csv::Error> {
     let mut reader = ReaderBuilder::new().from_path(path)?;
-    let mut data = MarketData::new();
+    let mut data = MarketData::new(1024); // Assuming initial capacity of 1024
 
     for result in reader.deserialize() {
         let record: CsvRecord = result?;
@@ -123,24 +132,22 @@ impl Backtester {
     }
 
     fn calculate_indicators(&mut self, configs: &[IndicatorConfig]) {
-        for config in configs {
-            let prices = &self.data.closes; // Assume `closes` is Vec<f64>
+        configs.par_iter().for_each(|config| {
+            let prices = &self.data.closes;
             let key = format!("{}_{}", config.name, config.parameters.get("period").unwrap_or(&0.0));
-    
+
             let indicator_values = match config.name.as_str() {
                 "sma" | "ema" => {
-                    let period = config.parameters.get("period")
-                        .copied()
-                        .unwrap_or(20.0) as usize; // Default period as usize
+                    let period = config.parameters.get("period").copied().unwrap_or(20.0) as usize;
                     let period_u8: u8 = period.try_into().expect("Period value is out of u8 range");
-    
+
                     match config.name.as_str() {
                         "sma" => {
-                            let mut sma = SMA::new(period_u8, &prices[0]).unwrap(); 
+                            let mut sma = SMA::new(period_u8, &prices[0]).unwrap();
                             prices.iter().map(|price| sma.next(price)).collect::<Vec<f64>>()
                         },
                         "ema" => {
-                            let mut ema = EMA::new(period_u8, &prices[0]).unwrap(); 
+                            let mut ema = EMA::new(period_u8, &prices[0]).unwrap();
                             prices.iter().map(|price| ema.next(price)).collect::<Vec<f64>>()
                         },
                         _ => unreachable!(),
@@ -149,7 +156,7 @@ impl Backtester {
                 _ => panic!("Unsupported indicator: {}", config.name),
             };
             self.indicators.insert(key, indicator_values);
-        }
+        });
     }
 
     fn evaluate_complex_condition(condition: &str, indicators: &HashMap<String, Vec<f64>>, index: usize) -> bool {
@@ -204,7 +211,7 @@ impl Backtester {
         take_profit_multiplier: f64,
         stop_loss_multiplier: f64,
     ) {
-        for i in 0..self.data.dates.len() {
+        self.data.dates.par_iter().enumerate().for_each(|(i, _)| {
             let current_equity = *self.equity.last().unwrap_or(&self.initial_margin);
             let margin_per_trade = current_equity * self.margin_percent_per_trade / 100.0;
             let entry_price = self.data.closes[i];
@@ -217,8 +224,9 @@ impl Backtester {
             }
 
             self.update_trades(i); // Update trades after conditions
-        }
+        });
     }
+
     #[inline]
     fn open_long_trade(&mut self, i: usize, entry_price: f64, position_size: f64, take_profit_multiplier: f64, stop_loss_multiplier: f64) {
         let entry_commission = entry_price * position_size * self.commission_rate / 100.0;
@@ -241,6 +249,7 @@ impl Backtester {
             self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) - (entry_commission + position_size));
         }
     }
+
     #[inline]
     fn open_short_trade(&mut self, i: usize, entry_price: f64, position_size: f64, take_profit_multiplier: f64, stop_loss_multiplier: f64) {
         let entry_commission = entry_price * position_size * self.commission_rate / 100.0;
@@ -263,6 +272,7 @@ impl Backtester {
             self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) - (entry_commission + position_size));
         }
     }
+
     #[inline]
     fn update_trades(&mut self, i: usize) {
         let highs = &self.data.highs;
@@ -270,7 +280,7 @@ impl Backtester {
         let closes = &self.data.closes;
         let dates = &self.data.dates;
 
-        for trade in &mut self.trades {
+        self.trades.par_iter_mut().for_each(|trade| {
             if trade.exit_time.is_none() && dates[i] > trade.entry_time {
                 if trade.is_long {
                     if highs[i] >= trade.take_profit || lows[i] <= trade.stop_loss {
@@ -294,13 +304,17 @@ impl Backtester {
                     }
                 }
             }
-        }
+        });
     }
 }
 
 pub fn backtesting(config: &str) -> Result<(Vec<f64>, Vec<Trade>), Box<dyn std::error::Error>> {
     let config: Config = serde_json::from_str(config)?;
     let data = read_csv_data("btc.csv")?;
+    if data.is_empty() {
+        return Err("Market data is empty".into());
+    }
+
     let mut backtester = Backtester::new(data, 10000.0, 0.04, 10.0, 10.0);
 
     backtester.calculate_indicators(&config.indicators);
