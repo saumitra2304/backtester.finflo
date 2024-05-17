@@ -420,7 +420,7 @@ fn main() {
         "api_key": "YOUR_API_KEY",
         "api_secret": "YOUR_API_SECRET",
         "symbol": "BTCUSDT",
-        "interval": "1d",
+        "interval": "1m",
         "start_time": "1708082907000",
         "end_time": "1715858907000"
     }
