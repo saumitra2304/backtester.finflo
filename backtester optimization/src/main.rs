@@ -1,21 +1,13 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use csv::ReaderBuilder;
+use serde_json::Value;
 use std::collections::HashMap;
-use rayon::prelude::*;
 use yata::methods::{EMA, SMA};
 use yata::prelude::*;
+use reqwest::blocking::Client;
+use reqwest::Error;
 
 #[derive(Debug, Deserialize)]
-struct CsvRecord {
-    date: String,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
-}
-
 pub struct MarketData {
     dates: Vec<NaiveDateTime>,
     opens: Vec<f64>,
@@ -55,19 +47,6 @@ impl MarketData {
     }
 }
 
-pub fn read_csv_data(path: &str) -> Result<MarketData, csv::Error> {
-    let mut reader = ReaderBuilder::new().from_path(path)?;
-    let mut data = MarketData::new(1024); // Assuming initial capacity of 1024
-
-    for result in reader.deserialize() {
-        let record: CsvRecord = result?;
-        let date = NaiveDateTime::parse_from_str(&record.date, "%d-%m-%Y %H:%M").expect("Invalid date format");
-        data.push(date, record.open, record.high, record.low, record.close, record.volume);
-    }
-
-    Ok(data)
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     indicators: Vec<IndicatorConfig>,
@@ -77,6 +56,12 @@ pub struct Config {
     short_exit_condition: String,
     take_profit_multiplier: f64,
     stop_loss_multiplier: f64,
+    api_key: String,
+    api_secret: String,
+    symbol: String,
+    interval: String,
+    start_time: String,
+    end_time: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -96,6 +81,7 @@ pub struct Trade {
     stop_loss: f64,
     take_profit: f64,
     is_long: bool,
+    closed: bool,
 }
 
 pub struct Backtester {
@@ -132,7 +118,7 @@ impl Backtester {
     }
 
     fn calculate_indicators(&mut self, configs: &[IndicatorConfig]) {
-        configs.par_iter().for_each(|config| {
+        configs.iter().for_each(|config| {
             let prices = &self.data.closes;
             let key = format!("{}_{}", config.name, config.parameters.get("period").unwrap_or(&0.0));
 
@@ -204,14 +190,15 @@ impl Backtester {
 
     fn backtest(
         &mut self,
-        long_entry_conditions: &[Box<dyn Fn(&Backtester, usize) -> bool>],
-        long_exit_conditions: &[Box<dyn Fn(&Backtester, &mut Trade, usize) -> bool>],
-        short_entry_conditions: &[Box<dyn Fn(&Backtester, usize) -> bool>],
-        short_exit_conditions: &[Box<dyn Fn(&Backtester, &mut Trade, usize) -> bool>],
+        long_entry_conditions: &[Box<dyn Fn(&Backtester, usize) -> bool + Send + Sync>],
+        long_exit_conditions: &[Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>],
+        short_entry_conditions: &[Box<dyn Fn(&Backtester, usize) -> bool + Send + Sync>],
+        short_exit_conditions: &[Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>],
         take_profit_multiplier: f64,
         stop_loss_multiplier: f64,
     ) {
-        self.data.dates.par_iter().enumerate().for_each(|(i, _)| {
+        let data = self.data.dates.clone();
+        data.iter().enumerate().for_each(|(i, _)| {
             let current_equity = *self.equity.last().unwrap_or(&self.initial_margin);
             let margin_per_trade = current_equity * self.margin_percent_per_trade / 100.0;
             let entry_price = self.data.closes[i];
@@ -223,7 +210,7 @@ impl Backtester {
                 self.open_short_trade(i, entry_price, position_size, take_profit_multiplier, stop_loss_multiplier);
             }
 
-            self.update_trades(i); // Update trades after conditions
+            self.update_trades(i, long_exit_conditions, short_exit_conditions);
         });
     }
 
@@ -244,6 +231,7 @@ impl Backtester {
                 stop_loss,
                 take_profit,
                 is_long: true,
+                closed: false,
             };
             self.trades.push(trade);
             self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) - (entry_commission + position_size));
@@ -267,6 +255,7 @@ impl Backtester {
                 stop_loss,
                 take_profit,
                 is_long: false,
+                closed: false,
             };
             self.trades.push(trade);
             self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) - (entry_commission + position_size));
@@ -274,43 +263,104 @@ impl Backtester {
     }
 
     #[inline]
-    fn update_trades(&mut self, i: usize) {
-        let highs = &self.data.highs;
-        let lows = &self.data.lows;
-        let closes = &self.data.closes;
-        let dates = &self.data.dates;
+    fn update_trades(
+        &mut self,
+        i: usize,
+        long_exit_conditions: &[Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>],
+        short_exit_conditions: &[Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>],
+    ) {
+        let highs = self.data.highs.clone();
+        let lows = self.data.lows.clone();
+        let dates = self.data.dates.clone();
 
-        self.trades.par_iter_mut().for_each(|trade| {
-            if trade.exit_time.is_none() && dates[i] > trade.entry_time {
+        let mut new_equity = *self.equity.last().unwrap_or(&self.initial_margin);
+
+        let mut to_close = Vec::new();
+
+        // First pass: determine which trades to close
+        for (j, trade) in self.trades.iter().enumerate() {
+            if !trade.closed && dates[i] > trade.entry_time {
+                let mut updated_trade = trade.clone();
+                let exit_price;
+                let exit_commission;
+                let profit;
+
                 if trade.is_long {
-                    if highs[i] >= trade.take_profit || lows[i] <= trade.stop_loss {
-                        let exit_price = if lows[i] <= trade.stop_loss { trade.stop_loss } else { trade.take_profit };
-                        let exit_commission = exit_price * (trade.margin_used * self.leverage / trade.entry_price) * self.commission_rate / 100.0;
-                        trade.exit_price = exit_price;
-                        trade.exit_time = Some(dates[i]);
-                        let profit = (trade.exit_price - trade.entry_price) * (trade.margin_used * self.leverage / trade.entry_price) - exit_commission;
-                        trade.profit_loss += profit;
-                        self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) + profit + trade.margin_used - exit_commission);
+                    let condition_met = highs[i] >= trade.take_profit
+                        || lows[i] <= trade.stop_loss
+                        || long_exit_conditions.iter().any(|condition| condition(self, trade, i));
+                    if condition_met {
+                        exit_price = if lows[i] <= trade.stop_loss { trade.stop_loss } else { trade.take_profit };
+                        exit_commission = exit_price * (trade.margin_used * self.leverage / trade.entry_price) * self.commission_rate / 100.0;
+                        updated_trade.exit_price = exit_price;
+                        updated_trade.exit_time = Some(dates[i]);
+                        profit = (updated_trade.exit_price - trade.entry_price) * (trade.margin_used * self.leverage / trade.entry_price) - exit_commission;
+                        updated_trade.profit_loss += profit;
+                        new_equity += profit + trade.margin_used - exit_commission;
+                        updated_trade.closed = true;
+                        to_close.push((j, updated_trade));
                     }
                 } else {
-                    if lows[i] <= trade.take_profit || highs[i] >= trade.stop_loss {
-                        let exit_price = if highs[i] >= trade.stop_loss { trade.stop_loss } else { trade.take_profit };
-                        let exit_commission = exit_price * (trade.margin_used * self.leverage / trade.entry_price) * self.commission_rate / 100.0;
-                        trade.exit_price = exit_price;
-                        trade.exit_time = Some(dates[i]);
-                        let profit = (trade.entry_price - trade.exit_price) * (trade.margin_used * self.leverage / trade.entry_price) - exit_commission;
-                        trade.profit_loss += profit;
-                        self.equity.push(self.equity.last().unwrap_or(&self.initial_margin) + profit + trade.margin_used - exit_commission);
+                    let condition_met = lows[i] <= trade.take_profit
+                        || highs[i] >= trade.stop_loss
+                        || short_exit_conditions.iter().any(|condition| condition(self, trade, i));
+                    if condition_met {
+                        exit_price = if highs[i] >= trade.stop_loss { trade.stop_loss } else { trade.take_profit };
+                        exit_commission = exit_price * (trade.margin_used * self.leverage / trade.entry_price) * self.commission_rate / 100.0;
+                        updated_trade.exit_price = exit_price;
+                        updated_trade.exit_time = Some(dates[i]);
+                        profit = (trade.entry_price - updated_trade.exit_price) * (trade.margin_used * self.leverage / trade.entry_price) - exit_commission;
+                        updated_trade.profit_loss += profit;
+                        new_equity += profit + trade.margin_used - exit_commission;
+                        updated_trade.closed = true;
+                        to_close.push((j, updated_trade));
                     }
                 }
             }
-        });
+        }
+
+        // Second pass: close trades
+        for (j, updated_trade) in to_close {
+            self.trades[j] = updated_trade;
+        }
+
+        // Update equity
+        self.equity.push(new_equity);
     }
+}
+
+pub fn fetch_binance_data(symbol: &str, interval: &str, start_time: &str, end_time: &str, api_key: &str) -> Result<MarketData, Error> {
+    let client = Client::new();
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}",
+        symbol, interval, start_time, end_time
+    );
+
+    let res = client
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()?
+        .json::<Value>()?;
+
+    let mut data = MarketData::new(res.as_array().unwrap().len());
+
+    for record in res.as_array().unwrap() {
+        let date = NaiveDateTime::from_timestamp_millis(record[0].as_i64().unwrap()).unwrap();
+        let open = record[1].as_str().unwrap().parse::<f64>().unwrap();
+        let high = record[2].as_str().unwrap().parse::<f64>().unwrap();
+        let low = record[3].as_str().unwrap().parse::<f64>().unwrap();
+        let close = record[4].as_str().unwrap().parse::<f64>().unwrap();
+        let volume = record[5].as_str().unwrap().parse::<f64>().unwrap();
+
+        data.push(date, open, high, low, close, volume);
+    }
+
+    Ok(data)
 }
 
 pub fn backtesting(config: &str) -> Result<(Vec<f64>, Vec<Trade>), Box<dyn std::error::Error>> {
     let config: Config = serde_json::from_str(config)?;
-    let data = read_csv_data("btc.csv")?;
+    let data = fetch_binance_data(&config.symbol, &config.interval, &config.start_time, &config.end_time, &config.api_key)?;
     if data.is_empty() {
         return Err("Market data is empty".into());
     }
@@ -319,17 +369,17 @@ pub fn backtesting(config: &str) -> Result<(Vec<f64>, Vec<Trade>), Box<dyn std::
 
     backtester.calculate_indicators(&config.indicators);
 
-    let long_entry_conditions: Vec<Box<dyn Fn(&Backtester, usize) -> bool>> = vec![
+    let long_entry_conditions: Vec<Box<dyn Fn(&Backtester, usize) -> bool + Send + Sync>> = vec![
         Box::new(move |backtester, i| Backtester::evaluate_complex_condition(&config.long_entry_condition, &backtester.indicators, i)),
     ];
-    let long_exit_conditions: Vec<Box<dyn Fn(&Backtester, &mut Trade, usize) -> bool>> = vec![
-        Box::new(move |backtester, _trade, i| Backtester::evaluate_complex_condition(&config.long_exit_condition, &backtester.indicators, i)),
+    let long_exit_conditions: Vec<Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>> = vec![
+        Box::new(move |backtester, trade, i| Backtester::evaluate_complex_condition(&config.long_exit_condition, &backtester.indicators, i)),
     ];
-    let short_entry_conditions: Vec<Box<dyn Fn(&Backtester, usize) -> bool>> = vec![
+    let short_entry_conditions: Vec<Box<dyn Fn(&Backtester, usize) -> bool + Send + Sync>> = vec![
         Box::new(move |backtester, i| Backtester::evaluate_complex_condition(&config.short_entry_condition, &backtester.indicators, i)),
     ];
-    let short_exit_conditions: Vec<Box<dyn Fn(&Backtester, &mut Trade, usize) -> bool>> = vec![
-        Box::new(move |backtester, _trade, i| Backtester::evaluate_complex_condition(&config.short_exit_condition, &backtester.indicators, i)),
+    let short_exit_conditions: Vec<Box<dyn Fn(&Backtester, &Trade, usize) -> bool + Send + Sync>> = vec![
+        Box::new(move |backtester, trade, i| Backtester::evaluate_complex_condition(&config.short_exit_condition, &backtester.indicators, i)),
     ];
 
     backtester.backtest(
@@ -366,7 +416,13 @@ fn main() {
         "short_entry_condition": "sma_50 > ema_20",
         "short_exit_condition": "sma_50 < ema_20",
         "take_profit_multiplier": 1.5,
-        "stop_loss_multiplier": 0.5
+        "stop_loss_multiplier": 0.5,
+        "api_key": "YOUR_API_KEY",
+        "api_secret": "YOUR_API_SECRET",
+        "symbol": "BTCUSDT",
+        "interval": "1d",
+        "start_time": "1708082907000",
+        "end_time": "1715858907000"
     }
     "#;
 
